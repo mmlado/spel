@@ -327,6 +327,7 @@ mod tests {
                 role: role.to_string(),
                 account: account.to_string(),
                 offset,
+                initializer: None,
             },
         )
     }
