@@ -241,6 +241,7 @@ fn expand_lez_program(input: ItemMod, config: ProgramConfig) -> syn::Result<Toke
     let mut deps = spel_framework_core::extension::resolve_program_deps(
         &manifest_dir,
         &input.attrs,
+        items,
         &mut |_| {},
     )
     .map_err(|msg| syn::Error::new(proc_macro2::Span::call_site(), msg))?;
@@ -277,6 +278,11 @@ fn expand_lez_program(input: ItemMod, config: ProgramConfig) -> syn::Result<Toke
                         &deps.extensions.inject_specs,
                         &deps.extensions.embeds,
                         None,
+                    )
+                    .map_err(|msg| syn::Error::new(proc_macro2::Span::call_site(), msg))?;
+                    spel_framework_core::extension::check_unmarked_gates(
+                        &func,
+                        &deps.extensions.unmarked_specs,
                     )
                     .map_err(|msg| syn::Error::new(proc_macro2::Span::call_site(), msg))?;
                     let mut info = parse_instruction(func)?;
@@ -2024,6 +2030,7 @@ fn expand_generate_idl(file_path: &str, span_token: &syn::LitStr) -> syn::Result
     let mut deps = spel_framework_core::extension::resolve_program_deps(
         &manifest_dir,
         &program_mod.attrs,
+        items,
         &mut |_| {},
     )
     .map_err(|msg| syn::Error::new(proc_macro2::Span::call_site(), msg))?;
@@ -2054,6 +2061,11 @@ fn expand_generate_idl(file_path: &str, span_token: &syn::LitStr) -> syn::Result
                     &deps.extensions.inject_specs,
                     &deps.extensions.embeds,
                     None,
+                )
+                .map_err(|msg| syn::Error::new(proc_macro2::Span::call_site(), msg))?;
+                spel_framework_core::extension::check_unmarked_gates(
+                    &func,
+                    &deps.extensions.unmarked_specs,
                 )
                 .map_err(|msg| syn::Error::new(proc_macro2::Span::call_site(), msg))?;
                 let mut info = parse_instruction(func)?;

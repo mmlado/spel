@@ -262,8 +262,9 @@ instruction `do_something`: #[require_not_paused] reads parameter `pause_config`
 ```
 
 Apply a gate under its own name and not inside `cfg_attr`. A module without the
-extension's marker gets neither injection nor this check, so it must pin the
-accounts its gates read itself.
+extension's marker gets no injection, but the check still runs on its
+instructions' gates, so every account those gates read must be declared and
+pinned.
 
 ---
 

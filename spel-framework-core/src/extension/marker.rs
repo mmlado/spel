@@ -171,6 +171,30 @@ pub fn candidate_marker_names(mod_attrs: &[Attribute]) -> Vec<String> {
         .collect()
 }
 
+/// True when an `#[instruction]` fn carries an attribute that could be an
+/// extension gate, by the marker filter. A module without markers then
+/// still reads its dependencies' inject specs for the pin check.
+pub fn has_gate_candidates(items: &[syn::Item]) -> bool {
+    let is_instruction = |a: &Attribute| {
+        a.path()
+            .segments
+            .last()
+            .is_some_and(|s| s.ident == "instruction")
+    };
+    items.iter().any(|item| {
+        let syn::Item::Fn(f) = item else {
+            return false;
+        };
+        f.attrs.iter().any(is_instruction)
+            && f.attrs.iter().any(|a| {
+                !is_instruction(a)
+                    && a.path()
+                        .get_ident()
+                        .is_none_or(|i| is_marker_candidate(&i.to_string()))
+            })
+    })
+}
+
 fn is_marker_candidate(ident: &str) -> bool {
     !matches!(
         ident,
@@ -324,6 +348,24 @@ mod tests {
         };
         assert!(!has_extension_marker_candidates(&m.attrs));
         assert!(!has_extension_marker_candidates(&[]));
+    }
+
+    #[test]
+    fn gate_candidates_need_an_unknown_attr_on_an_instruction() {
+        let plain: Vec<syn::Item> = vec![syn::parse_quote! {
+            #[instruction]
+            #[doc = "plain"]
+            pub fn a() {}
+        }];
+        assert!(!has_gate_candidates(&plain));
+        let helper: Vec<syn::Item> = vec![syn::parse_quote! { #[my_gate] fn b() {} }];
+        assert!(!has_gate_candidates(&helper));
+        let gated: Vec<syn::Item> = vec![syn::parse_quote! {
+            #[instruction]
+            #[my_gate]
+            pub fn c() {}
+        }];
+        assert!(has_gate_candidates(&gated));
     }
 
     #[test]

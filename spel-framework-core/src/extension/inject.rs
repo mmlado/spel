@@ -119,6 +119,18 @@ pub fn apply_wrap_and_inject(
     Ok(injected)
 }
 
+/// Pin check for gates of extensions whose marker the module lacks. Nothing
+/// is injected or stamped there, so each gate reads its own kwargs or
+/// defaults.
+///
+/// # Errors
+///
+/// `Err` naming the instruction and parameter when a gate reads an account
+/// that is not pinned to its spec's seeds.
+pub fn check_unmarked_gates(func: &ItemFn, specs: &[InjectSpec]) -> Result<(), String> {
+    check_gate_reads_pinned(func, specs, &HashMap::new())
+}
+
 /// Gates trust every non-signer account they read, so each must carry its spec's pin.
 fn check_gate_reads_pinned(
     func: &ItemFn,
@@ -2115,6 +2127,31 @@ mod tests {
         };
         let err = apply_wrap_and_inject(&mut func, &[], &gate_specs(), &[], None).unwrap_err();
         assert!(err.contains("#[my_gate] inside cfg_attr"), "got: {err}");
+    }
+
+    #[test]
+    fn unmarked_gate_reading_an_unpinned_param_is_error() {
+        let func: ItemFn = parse_quote! {
+            #[my_gate]
+            pub fn update_value(gate_config: AccountWithMetadata) -> SpelResult { todo!() }
+        };
+        let err = check_unmarked_gates(&func, &gate_specs()).unwrap_err();
+        assert!(
+            err.contains("`gate_config`") && err.contains("found no pda"),
+            "got: {err}"
+        );
+    }
+
+    #[test]
+    fn unmarked_gate_reading_a_pinned_param_passes() {
+        let func: ItemFn = parse_quote! {
+            #[my_gate]
+            pub fn update_value(
+                #[account(pda = literal("gate_config"))] gate_config: AccountWithMetadata,
+                #[account(signer)] caller: AccountWithMetadata,
+            ) -> SpelResult { todo!() }
+        };
+        check_unmarked_gates(&func, &gate_specs()).unwrap();
     }
 
     #[test]

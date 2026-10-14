@@ -74,11 +74,12 @@ mod marker;
 mod metadata;
 
 pub use inject::{
-    active_wraps, apply_wrap_and_inject, resolve_canonical_constraint, rewrite_embedded_roles,
+    active_wraps, apply_wrap_and_inject, check_unmarked_gates, resolve_canonical_constraint,
+    rewrite_embedded_roles,
 };
 pub use marker::{
-    candidate_marker_names, has_extension_marker_candidates, parse_marker_args, EmbedDecl,
-    MarkerArgs,
+    candidate_marker_names, has_extension_marker_candidates, has_gate_candidates,
+    parse_marker_args, EmbedDecl, MarkerArgs,
 };
 
 use metadata::{
@@ -100,6 +101,9 @@ pub struct ExtensionDiscoveries {
     /// carrying a spec's bare wrapper attr get missing params
     /// synthesized by [`apply_wrap_and_inject`].
     pub inject_specs: Vec<InjectSpec>,
+    /// Inject specs of dependencies whose marker the module lacks. They
+    /// inject nothing and only feed [`check_unmarked_gates`].
+    pub unmarked_specs: Vec<InjectSpec>,
     /// Active wrap configs, paired with the consumer marker attr's arg
     /// (`""` for a bare marker) so callers can honor `skip`.
     pub wraps: Vec<(String, WrapInstructions)>,
@@ -212,7 +216,7 @@ struct MatchedExtension {
 
 /// Producer entry point: marker pre-check, graph resolution, and
 /// extension discovery in one call. Modules without candidate markers
-/// skip the cargo metadata walk and discovery entirely.
+/// or candidate gates skip the cargo metadata walk and discovery entirely.
 ///
 /// # Errors
 ///
@@ -223,16 +227,25 @@ struct MatchedExtension {
 pub fn resolve_program_deps<F: FnMut(String)>(
     start: &Path,
     mod_attrs: &[Attribute],
+    items: &[syn::Item],
     on_warning: &mut F,
 ) -> Result<ProgramDeps, String> {
-    let with_metadata = has_extension_marker_candidates(mod_attrs);
+    let with_markers = has_extension_marker_candidates(mod_attrs);
+    let with_metadata = with_markers || has_gate_candidates(items);
     let graph = crate::dep_walk::resolve_dep_graph(start, with_metadata, on_warning);
     let extensions = if with_metadata {
         discover_extensions(&graph.direct_dirs, mod_attrs, on_warning)?
     } else {
         ExtensionDiscoveries::default()
     };
-    if with_metadata {
+    if !with_markers {
+        if let (true, Some(reason)) = (with_metadata, &graph.metadata_failure) {
+            on_warning(format!(
+                "dependency resolution degraded ({reason}); gates on instructions \
+                are not checked against extension specs"
+            ));
+        }
+    } else {
         let unmatched: Vec<String> = candidate_marker_names(mod_attrs)
             .into_iter()
             .filter(|c| !extensions.matched_markers.contains(c))
@@ -282,6 +295,7 @@ pub fn discover_extensions<F: FnMut(String)>(
     on_warning: &mut F,
 ) -> Result<ExtensionDiscoveries, String> {
     let mut matched: Vec<MatchedExtension> = Vec::new();
+    let mut unmarked: Vec<InjectSpec> = Vec::new();
 
     let lez_pos = mod_attrs
         .iter()
@@ -294,6 +308,17 @@ pub fn discover_extensions<F: FnMut(String)>(
             continue;
         };
         if !mod_attrs.iter().any(|a| a.path().is_ident(&ext_attr)) {
+            // Unmarked gates get no injection, so their specs only feed the pin check.
+            match read_spel_inject_specs(&manifest_value, dep_dir) {
+                Ok(mut specs) => {
+                    let source = read_package_ident(&manifest_value).unwrap_or_default();
+                    for spec in &mut specs {
+                        spec.source.clone_from(&source);
+                    }
+                    unmarked.extend(specs);
+                },
+                Err(e) => on_warning(format!("{e}; its gates are not checked")),
+            }
             continue;
         }
         if let (Some(lez), Some(marker)) = (
@@ -445,7 +470,9 @@ pub fn discover_extensions<F: FnMut(String)>(
         });
     }
 
-    Ok(flatten_in_marker_order(matched))
+    let mut out = flatten_in_marker_order(matched);
+    out.unmarked_specs = unmarked;
+    Ok(out)
 }
 
 /// Resolve one bound arg to its compile-time value.
@@ -856,7 +883,7 @@ pub fn ext_action(account: AccountWithMetadata) -> SpelResult { todo!() }
 "#,
         );
 
-        let deps = resolve_program_deps(&tmp.path().join("user"), &mod_attrs, &mut |_| {})
+        let deps = resolve_program_deps(&tmp.path().join("user"), &mod_attrs, &[], &mut |_| {})
             .expect("discovery through the producer entry point");
         assert_eq!(deps.extensions.instructions.len(), 1);
         assert!(
@@ -889,7 +916,7 @@ pub fn ext_action(account: AccountWithMetadata) -> SpelResult { todo!() }
             #[my_extt]
         );
 
-        let err = resolve_program_deps(&tmp.path().join("user"), &mod_attrs, &mut |_| {})
+        let err = resolve_program_deps(&tmp.path().join("user"), &mod_attrs, &[], &mut |_| {})
             .expect_err("an unmatched marker must refuse to compile");
         assert!(
             err.contains("my_extt") && err.contains("transitive"),
@@ -936,12 +963,43 @@ nssa_core = { git = "https://example.com/repo.git", tag = "v1.0" }
             #[doc = "no markers here"]
         );
         let mut warnings = Vec::new();
-        let deps = resolve_program_deps(&tmp.path().join("user"), &mod_attrs, &mut |w| {
+        let deps = resolve_program_deps(&tmp.path().join("user"), &mod_attrs, &[], &mut |w| {
             warnings.push(w)
         })
         .expect("no markers is not an error");
         assert!(warnings.is_empty(), "metadata must not run: {warnings:?}");
         assert!(deps.extensions.instructions.is_empty());
+    }
+
+    #[test]
+    fn gate_candidates_without_a_marker_load_unmarked_specs() {
+        let tmp = TempDir::new("program-deps-unmarked-gate");
+        ext_fixture(
+            &tmp,
+            r#"
+[package.metadata.spel]
+extension_attr = "my_ext"
+
+[[package.metadata.spel.inject]]
+wrapper = "my_gate"
+
+  [[package.metadata.spel.inject.account]]
+  name = "gate_config"
+  seed = [{ const = "gate_config" }]
+"#,
+            "",
+        );
+        let mod_attrs: Vec<Attribute> = syn::parse_quote!(#[lez_program]);
+        let items: Vec<syn::Item> = vec![syn::parse_quote! {
+            #[instruction]
+            #[my_gate]
+            pub fn update(gate_config: AccountWithMetadata) -> SpelResult { todo!() }
+        }];
+        let deps = resolve_program_deps(&tmp.path().join("user"), &mod_attrs, &items, &mut |_| {})
+            .expect("an unmarked gate is not an error by itself");
+        assert!(deps.extensions.instructions.is_empty());
+        assert_eq!(deps.extensions.unmarked_specs.len(), 1);
+        assert_eq!(deps.extensions.unmarked_specs[0].wrapper, "my_gate");
     }
 
     #[test]
@@ -963,7 +1021,7 @@ pub fn ext_action(account: AccountWithMetadata) -> SpelResult { todo!() }
             #[lez_program]
         );
 
-        let err = resolve_program_deps(&tmp.path().join("user"), &mod_attrs, &mut |_| {})
+        let err = resolve_program_deps(&tmp.path().join("user"), &mod_attrs, &[], &mut |_| {})
             .expect_err("misplaced marker must propagate");
         assert!(
             err.contains("above #[lez_program]"),
@@ -1184,7 +1242,7 @@ edition = "2021"
             #[lez_program]
             #[ghost_ext]
         );
-        let err = resolve_program_deps(&tmp.path().join("user"), &mod_attrs, &mut |_| {})
+        let err = resolve_program_deps(&tmp.path().join("user"), &mod_attrs, &[], &mut |_| {})
             .expect_err("unmatched marker with failed metadata must refuse to compile");
         assert!(
             err.contains("refusing to compile"),
@@ -1235,7 +1293,7 @@ my-ext = { path = "../my-ext" }
             #[my_ext]
         );
         let mut warnings = Vec::new();
-        let deps = resolve_program_deps(&tmp.path().join("user"), &mod_attrs, &mut |w| {
+        let deps = resolve_program_deps(&tmp.path().join("user"), &mod_attrs, &[], &mut |w| {
             warnings.push(w)
         })
         .expect("matched path marker must compile through a degraded resolution");
